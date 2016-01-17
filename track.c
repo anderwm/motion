@@ -8,11 +8,15 @@
 
 #include <math.h>
 #include "motion.h"
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #if defined(HAVE_LINUX_VIDEODEV_H) && (!defined(WITHOUT_V4L))
 #include "pwc-ioctl.h"
 #endif
 
+#define CONNECT_TIMEOUT        10     /* Timeout on remote connection attempt */
 
 struct trackoptions track_template = {
     dev:            -1,             /* dev open */
@@ -40,6 +44,8 @@ struct trackoptions track_template = {
 
 
 /* Add your own center and move functions here: */
+static int netcam_move(struct context *cnt, struct coord *cent, struct images *imgs);
+static int netcam_center();
 
 static unsigned int servo_position(struct context *cnt, unsigned int motor);
 
@@ -93,6 +99,8 @@ unsigned int track_center(struct context *cnt, int dev ATTRIBUTE_UNUSED,
         return iomojo_center(cnt, xoff, yoff);
     else if (cnt->track.type == TRACK_TYPE_GENERIC)
         return 10; // FIX ME. I chose to return something reasonable.
+    else if (cnt->track.type == TRACK_TYPE_WEBCAM)
+	return netcam_center();
 
     MOTION_LOG(ERR, TYPE_TRACK, SHOW_ERRNO, "%s: internal error, %hu is not a known track-type",
                cnt->track.type);
@@ -124,6 +132,8 @@ unsigned int track_move(struct context *cnt, int dev, struct coord *cent, struct
         return iomojo_move(cnt, dev, cent, imgs);
     else if (cnt->track.type == TRACK_TYPE_GENERIC)
         return cnt->track.move_wait; // FIX ME. I chose to return something reasonable.
+    else if (cnt->track.type == TRACK_TYPE_WEBCAM)
+	return netcam_move(cnt, cent, imgs);
 
     MOTION_LOG(WRN, TYPE_TRACK, SHOW_ERRNO, "%s: internal error, %hu is not a known track-type",
                cnt->track.type);
@@ -131,6 +141,334 @@ unsigned int track_move(struct context *cnt, int dev, struct coord *cent, struct
     return 0;
 }
 
+static int netcam_center()
+{
+    struct sockaddr_in server;      /* For connect */
+    struct addrinfo *res;           /* For getaddrinfo */
+    char host[13] = "192.168.1.125";
+    char request[1024];
+    char response[1024];
+    char *connect_host = host;         /* the host to connect to (may be
+                                   either the camera host, or
+                                   possibly a proxy) */   
+    int connect_port = 80;           /* usually will be 80, but can be
+                                   specified as something else by
+                                   the user */
+    int total;
+    char *connect_request = request;      /* contains the complete string
+                                   required for connection to the
+                                   camera */
+    int sock;
+    int ret;
+    int saveflags;
+    int back_err;
+    int optval;
+    socklen_t optlen = sizeof(optval);
+    socklen_t len;
+    fd_set fd_w;
+    struct timeval selecttime;
+
+    strcpy("GET /decoder_control.cgi?user=admin&pwd=123456&command=33 HTTP/1.0\r\n\r\n", request);
+
+    /* Lookup the hostname given in the netcam URL. */
+    if ((ret = getaddrinfo(connect_host, NULL, NULL, &res)) != 0)
+    {
+        MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: getaddrinfo() failed (%s): %s",
+                       connect_host, gai_strerror(ret));
+        MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO, "%s: disconnecting netcam (1)");
+        return -1;
+    }
+
+    /*
+     * Fill the hostname details into the 'server' structure and
+     * attempt to connect to the remote server.
+     */
+    memset(&server, 0, sizeof(server));
+    memcpy(&server, res->ai_addr, sizeof(server));
+    freeaddrinfo(res);
+
+    server.sin_family = AF_INET;
+    server.sin_port = htons(connect_port);
+
+    /*
+     * We set the socket non-blocking and then use a 'select'
+     * system call to control the timeout.
+     */
+
+    if ((saveflags = fcntl(sock, F_GETFL, 0)) < 0) {
+        MOTION_LOG(ERR, TYPE_NETCAM, SHOW_ERRNO, "%s: fcntl(1) on socket");
+        return -1;
+    }
+
+    /* Set the socket non-blocking. */
+    if (fcntl(sock, F_SETFL, saveflags | O_NONBLOCK) < 0) {
+        MOTION_LOG(ERR, TYPE_NETCAM, SHOW_ERRNO, "%s: fcntl(2) on socket");
+        return -1;
+    }
+
+    /* Now the connect call will return immediately. */
+    ret = connect(sock, (struct sockaddr *) &server,
+                  sizeof(server));
+    back_err = errno;           /* Save the errno from connect */
+
+    /* If the connect failed with anything except EINPROGRESS, error. */
+    if ((ret < 0) && (back_err != EINPROGRESS))
+    {
+        MOTION_LOG(ERR, TYPE_NETCAM, SHOW_ERRNO, "%s: connect() failed (%d)", 
+                       back_err);
+
+        MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO, "%s: disconnecting netcam (4)");
+        return -1;
+    }
+
+    /* Now we do a 'select' with timeout to wait for the connect. */
+    FD_ZERO(&fd_w);
+    FD_SET(sock, &fd_w);
+    selecttime.tv_sec = CONNECT_TIMEOUT;
+    selecttime.tv_usec = 0;
+    ret = select(FD_SETSIZE, NULL, &fd_w, NULL, &selecttime);
+
+    if (ret == 0)
+    {            /* 0 means timeout. */
+        MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: timeout on connect()");
+        
+        MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO, "%s: disconnecting netcam (2)");;
+        return -1;
+    }
+
+    /*
+     * A +ve value returned from the select (actually, it must be a
+     * '1' showing 1 fd's changed) shows the select has completed.
+     * Now we must check the return code from the select.
+     */
+    len = sizeof(ret);
+
+    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &ret, &len) < 0) {
+        MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: getsockopt after connect");
+        return -1;
+    }
+
+    /* If the return code is anything except 0, error on connect. */
+    if (ret)
+    {
+        MOTION_LOG(ERR, TYPE_NETCAM, SHOW_ERRNO, "%s: connect returned error");
+        MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO, "%s: disconnecting netcam (3)");
+        return -1;
+    }
+
+/* send the request */
+    total = strlen(connect_request);
+    int bytes;
+    int sent = 0;
+    do {
+        bytes = write(sock,connect_request+sent,total-sent);
+        if (bytes < 0)
+            error("ERROR writing message to socket");
+        if (bytes == 0)
+            break;
+        sent+=bytes;
+    } while (sent < total);
+
+    /* receive the response */
+    memset(response,0,sizeof(response));
+    total = sizeof(response)-1;
+    int received = 0;
+    do {
+        bytes = read(sock,response+received,total-received);
+        if (bytes < 0)
+            error("ERROR reading response from socket");
+        if (bytes == 0)
+            break;
+        received+=bytes;
+    } while (received < total);
+
+    if (received == total)
+        error("ERROR storing complete response from socket");
+
+    /* close the socket */
+    close(sock);
+    printf("Response:\n%s\n",response);
+    return 0;   /* Success */
+}
+/**
+ * netcam_move
+ *
+ *
+ * Parameters:
+ *
+ *
+ * Returns:     0 for success, -1 for error
+ *
+ */
+static int netcam_move(struct context *cnt, struct coord *cent, struct images *imgs)
+{
+    struct sockaddr_in server;      /* For connect */
+    struct addrinfo *res;           /* For getaddrinfo */
+    char host[13] = "192.168.1.125";
+    char request[1024];
+    char response[1024];
+    char *connect_host = host;         /* the host to connect to (may be
+                                   either the camera host, or
+                                   possibly a proxy) */   
+    int connect_port = 80;           /* usually will be 80, but can be
+                                   specified as something else by
+                                   the user */
+    int total;
+    char *connect_request = request;      /* contains the complete string
+                                   required for connection to the
+                                   camera */
+    int sock;
+    int ret;
+    int saveflags;
+    int back_err;
+    int optval;
+    socklen_t optlen = sizeof(optval);
+    socklen_t len;
+    fd_set fd_w;
+    struct timeval selecttime;
+
+    /* x-axis */
+
+    if (cent->x < imgs->width / 2)	//left
+        strcpy(request, "GET /decoder_control.cgi?user=admin&pwd=123456&command=4&onestep=1 HTTP/1.0\r\n\r\n");
+    if (cent->x > imgs->width / 2)	//right
+        strcpy(request, "GET /decoder_control.cgi?user=admin&pwd=123456&command=6&onestep=1 HTTP/1.0\r\n\r\n");
+
+    /* y-axis */
+
+    if (cent->y < imgs->height / 2)	//up
+        strcpy(request, "GET /decoder_control.cgi?user=admin&pwd=123456&command=0&onestep=1 HTTP/1.0\r\n\r\n");
+    if (cent->y > imgs->height / 2)	//down
+        strcpy(request, "GET /decoder_control.cgi?user=admin&pwd=123456&command=2&onestep=1 HTTP/1.0\r\n\r\n");
+
+	/* Create a new socket. */
+    if ((sock = socket(PF_INET, SOCK_STREAM, 0)) < 0)
+    {
+        MOTION_LOG(WRN, TYPE_NETCAM, SHOW_ERRNO, "%s:  with no keepalive, attempt "
+		       "to create socket failed.");
+        return -1;
+    }
+
+    /* Lookup the hostname given in the netcam URL. */
+    if ((ret = getaddrinfo(connect_host, NULL, NULL, &res)) != 0)
+    {
+        MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: getaddrinfo() failed (%s): %s",
+                       connect_host, gai_strerror(ret));
+        MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO, "%s: disconnecting netcam (1)");
+        return -1;
+    }
+
+    /*
+     * Fill the hostname details into the 'server' structure and
+     * attempt to connect to the remote server.
+     */
+    memset(&server, 0, sizeof(server));
+    memcpy(&server, res->ai_addr, sizeof(server));
+    freeaddrinfo(res);
+
+    server.sin_family = AF_INET;
+    server.sin_port = htons(connect_port);
+
+    /*
+     * We set the socket non-blocking and then use a 'select'
+     * system call to control the timeout.
+     */
+
+    if ((saveflags = fcntl(sock, F_GETFL, 0)) < 0) {
+        MOTION_LOG(ERR, TYPE_NETCAM, SHOW_ERRNO, "%s: fcntl(1) on socket");
+        return -1;
+    }
+
+    /* Set the socket non-blocking. */
+    if (fcntl(sock, F_SETFL, saveflags | O_NONBLOCK) < 0) {
+        MOTION_LOG(ERR, TYPE_NETCAM, SHOW_ERRNO, "%s: fcntl(2) on socket");
+        return -1;
+    }
+
+    /* Now the connect call will return immediately. */
+    ret = connect(sock, (struct sockaddr *) &server,
+                  sizeof(server));
+    back_err = errno;           /* Save the errno from connect */
+
+    /* If the connect failed with anything except EINPROGRESS, error. */
+    if ((ret < 0) && (back_err != EINPROGRESS))
+    {
+        MOTION_LOG(ERR, TYPE_NETCAM, SHOW_ERRNO, "%s: connect() failed (%d)", 
+                       back_err);
+
+        MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO, "%s: disconnecting netcam (4)");
+        return -1;
+    }
+
+    /* Now we do a 'select' with timeout to wait for the connect. */
+    FD_ZERO(&fd_w);
+    FD_SET(sock, &fd_w);
+    selecttime.tv_sec = CONNECT_TIMEOUT;
+    selecttime.tv_usec = 0;
+    ret = select(FD_SETSIZE, NULL, &fd_w, NULL, &selecttime);
+
+    if (ret == 0)
+    {            /* 0 means timeout. */
+        MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: timeout on connect()");
+        
+        MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO, "%s: disconnecting netcam (2)");;
+        return -1;
+    }
+
+    /*
+     * A +ve value returned from the select (actually, it must be a
+     * '1' showing 1 fd's changed) shows the select has completed.
+     * Now we must check the return code from the select.
+     */
+    len = sizeof(ret);
+
+    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &ret, &len) < 0) {
+        MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: getsockopt after connect");
+        return -1;
+    }
+
+    /* If the return code is anything except 0, error on connect. */
+    if (ret)
+    {
+        MOTION_LOG(ERR, TYPE_NETCAM, SHOW_ERRNO, "%s: connect returned error");
+        MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO, "%s: disconnecting netcam (3)");
+        return -1;
+    }
+
+/* send the request */
+    total = strlen(connect_request);
+    int bytes;
+    int sent = 0;
+    do {
+        bytes = write(sock,connect_request+sent,total-sent);
+        if (bytes < 0)
+            error("ERROR writing message to socket");
+        if (bytes == 0)
+            break;
+        sent+=bytes;
+    } while (sent < total);
+
+    /* receive the response */
+    memset(response,0,sizeof(response));
+    total = sizeof(response)-1;
+    int received = 0;
+    do {
+        bytes = read(sock,response+received,total-received);
+        if (bytes < 0)
+            error("ERROR reading response from socket");
+        if (bytes == 0)
+            break;
+        received+=bytes;
+    } while (received < total);
+
+    if (received == total)
+        error("ERROR storing complete response from socket");
+
+    /* close the socket */
+    close(sock);
+    printf("Response:\n%s\n",response);
+    return 0;   /* Success */
+}
 /******************************************************************************
     Stepper motor on serial port
     http://www.lavrsen.dk/twiki/bin/view/Motion/MotionTracking
