@@ -102,7 +102,7 @@ unsigned int track_center(struct context *cnt, int dev ATTRIBUTE_UNUSED,
     else if (cnt->track.type == TRACK_TYPE_WEBCAM)
 	return netcam_center();
 
-    MOTION_LOG(ERR, TYPE_TRACK, SHOW_ERRNO, "%s: internal error, %hu is not a known track-type",
+    MOTION_LOG(ERR, TYPE_TRACK, SHOW_ERRNO, "%s: internal error track_center, %hu is not a known track-type",
                cnt->track.type);
 
     return 0;
@@ -135,7 +135,7 @@ unsigned int track_move(struct context *cnt, int dev, struct coord *cent, struct
     else if (cnt->track.type == TRACK_TYPE_WEBCAM)
 	return netcam_move(cnt, cent, imgs);
 
-    MOTION_LOG(WRN, TYPE_TRACK, SHOW_ERRNO, "%s: internal error, %hu is not a known track-type",
+    MOTION_LOG(WRN, TYPE_TRACK, SHOW_ERRNO, "%s: internal error track_move, %hu is not a known track-type",
                cnt->track.type);
 
     return 0;
@@ -170,6 +170,13 @@ static int netcam_center()
 
     strcpy("GET /decoder_control.cgi?user=admin&pwd=123456&command=33 HTTP/1.0\r\n\r\n", request);
 
+	/* Create a new socket. */
+    if ((sock = socket(PF_INET, SOCK_STREAM, 0)) < 0)
+    {
+        MOTION_LOG(WRN, TYPE_NETCAM, SHOW_ERRNO, "%s:  with no keepalive, attempt "
+		       "to create socket failed.");
+        return -1;
+    }
     /* Lookup the hostname given in the netcam URL. */
     if ((ret = getaddrinfo(connect_host, NULL, NULL, &res)) != 0)
     {
